@@ -1,8 +1,9 @@
 import os
 import json
+import time
 import asyncio
 import requests
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 
@@ -16,7 +17,11 @@ CHANNEL_LINK = "https://t.me/FabriAr3"
 
 STATE_FILE = "last_id.json"
 DOWNLOAD_TIMEOUT = 90
-FIRST_RUN_COUNT = 5
+FIRST_RUN_BACKFILL = 5
+MAX_RUNTIME_SECONDS = 5 * 3600 + 40 * 60  # 5 ساعات و40 دقيقة
+
+client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+
 
 def load_last_id():
     if os.path.exists(STATE_FILE):
@@ -24,10 +29,12 @@ def load_last_id():
             return json.load(f).get("last_id", 0)
     return 0
 
+
 def save_last_id(msg_id):
     with open(STATE_FILE, "w") as f:
         json.dump({"last_id": msg_id}, f)
     print("DEBUG: saved last_id =", msg_id)
+
 
 def send_to_telegram(text, media_path=None, media_type=None):
     full_text = f"{text}\n\n{CHANNEL_LINK}" if text else CHANNEL_LINK
@@ -38,84 +45,90 @@ def send_to_telegram(text, media_path=None, media_type=None):
             r = requests.post(url, data={"chat_id": TARGET_CHANNEL, "caption": full_text}, files={"photo": f}, timeout=60)
     else:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        r = requests.post(url, data={"chat_id": TARGET_CHANNEL, "text": full_text}, timeout=30)
+        r = requests.post(url, data={"chat_id": TARGET_CHANNEL, "text": full_text, "disable_web_page_preview": True}, timeout=30)
 
     print("TELEGRAM SEND STATUS:", r.status_code)
     print("TELEGRAM SEND RESPONSE:", r.text)
+    r.raise_for_status()
 
-async def main():
-    client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-    await client.start()
 
+async def handle_message(msg):
     last_id = load_last_id()
-    is_first_run = (last_id == 0)
-    new_last_id = last_id
+    if msg.id <= last_id:
+        return
 
-    if is_first_run:
-        print("DEBUG: first run detected, fetching last", FIRST_RUN_COUNT, "posts only")
-        messages = await client.get_messages(SOURCE_CHANNEL, limit=FIRST_RUN_COUNT)
-        messages = list(reversed(messages))
-    else:
-        messages = await client.get_messages(SOURCE_CHANNEL, min_id=last_id, limit=10)
-        messages = list(reversed(messages))
+    text = msg.message or ""
+    full_text = f"{text}\n\n{CHANNEL_LINK}" if text else CHANNEL_LINK
 
-    print("DEBUG messages found:", len(messages))
+    is_video = bool(msg.media and isinstance(msg.media, MessageMediaDocument) and msg.video)
+    is_photo = bool(msg.media and isinstance(msg.media, MessageMediaPhoto))
 
-    for msg in messages:
-        text = msg.message or ""
-        full_text = f"{text}\n\n{CHANNEL_LINK}" if text else CHANNEL_LINK
-
-        is_video = bool(msg.media and isinstance(msg.media, MessageMediaDocument) and msg.video)
-        is_photo = bool(msg.media and isinstance(msg.media, MessageMediaPhoto))
-
-        # الفيديو: تحويل (forward) مباشرة بدون تحميل، مع إخفاء اسم المرسل، ثم تعديل الوصف
+    try:
         if is_video:
-            try:
-                sent = await client.forward_messages(TARGET_CHANNEL, msg, drop_author=True)
-                sent_msg = sent[0] if isinstance(sent, list) else sent
-                await client.edit_message(TARGET_CHANNEL, sent_msg, full_text)
-                print("DEBUG: forwarded video for msg", msg.id)
-            except Exception as e:
-                print("DEBUG: forward/edit failed for msg", msg.id, ":", e)
-            if msg.id > new_last_id:
-                new_last_id = msg.id
-            continue
+            sent = await client.forward_messages(TARGET_CHANNEL, msg, drop_author=True)
+            sent_msg = sent[0] if isinstance(sent, list) else sent
+            await client.edit_message(TARGET_CHANNEL, sent_msg, full_text)
+            print("DEBUG: forwarded video for msg", msg.id)
 
-        # الصورة: تحميل وإرسال عن طريق البوت
-        media_path = None
-        media_type = None
-        if is_photo:
+        elif is_photo:
+            media_path = None
             try:
                 media_path = await asyncio.wait_for(
                     client.download_media(msg, file="temp_media"),
                     timeout=DOWNLOAD_TIMEOUT
                 )
-                media_type = "photo"
-            except asyncio.TimeoutError:
-                print("DEBUG: photo download timed out, sending as text only")
-                media_path = None
-                media_type = None
             except Exception as e:
                 print("DEBUG: photo download failed:", e)
-                media_path = None
-                media_type = None
 
-        if not text.strip() and not media_path:
-            if msg.id > new_last_id:
-                new_last_id = msg.id
-            continue
+            if media_path:
+                send_to_telegram(text, media_path, "photo")
+                if os.path.exists(media_path):
+                    os.remove(media_path)
+            elif text.strip():
+                send_to_telegram(text)
+            else:
+                print("DEBUG: skipping empty message", msg.id)
 
-        send_to_telegram(text, media_path, media_type)
+        elif text.strip():
+            send_to_telegram(text)
 
-        if media_path and os.path.exists(media_path):
-            os.remove(media_path)
+        else:
+            print("DEBUG: skipping empty message", msg.id)
 
-        if msg.id > new_last_id:
-            new_last_id = msg.id
+    except Exception as e:
+        print("DEBUG: failed to process msg", msg.id, ":", e)
+        return  # لا نحدث last_id لو فشل، عشان يحاول مرة ثانية لاحقاً
 
-    if new_last_id > last_id or is_first_run:
-        save_last_id(new_last_id if new_last_id > 0 else last_id)
+    save_last_id(msg.id)
 
+
+@client.on(events.NewMessage(chats=SOURCE_CHANNEL))
+async def live_handler(event):
+    await handle_message(event.message)
+
+
+async def catch_up():
+    last_id = load_last_id()
+    if last_id == 0:
+        print("DEBUG: first run, backfilling last", FIRST_RUN_BACKFILL, "posts only")
+        latest = await client.get_messages(SOURCE_CHANNEL, limit=1)
+        if latest:
+            last_id = max(latest[0].id - FIRST_RUN_BACKFILL, 0)
+            save_last_id(last_id)
+
+    messages = await client.get_messages(SOURCE_CHANNEL, min_id=last_id, limit=50)
+    for msg in reversed(messages):
+        await handle_message(msg)
+
+
+async def main():
+    await client.start()
+    await catch_up()
+    print("DEBUG: listening live for new messages...")
+    start = time.time()
+    while time.time() - start < MAX_RUNTIME_SECONDS:
+        await asyncio.sleep(30)
     await client.disconnect()
+
 
 asyncio.run(main())
