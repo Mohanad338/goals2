@@ -17,7 +17,6 @@ CHANNEL_LINK = "https://t.me/FabriAr3"
 STATE_FILE = "last_id.json"
 DOWNLOAD_TIMEOUT = 90
 FIRST_RUN_COUNT = 5
-VIDEO_MAX_SECONDS = 600  # 10 دقائق - أي فيديو أطول من هذا يتجاهل ولا ينشر
 
 def load_last_id():
     if os.path.exists(STATE_FILE):
@@ -37,24 +36,12 @@ def send_to_telegram(text, media_path=None, media_type=None):
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
         with open(media_path, "rb") as f:
             r = requests.post(url, data={"chat_id": TARGET_CHANNEL, "caption": full_text}, files={"photo": f}, timeout=60)
-    elif media_type == "video":
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
-        with open(media_path, "rb") as f:
-            r = requests.post(url, data={"chat_id": TARGET_CHANNEL, "caption": full_text}, files={"video": f}, timeout=120)
     else:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         r = requests.post(url, data={"chat_id": TARGET_CHANNEL, "text": full_text}, timeout=30)
 
     print("TELEGRAM SEND STATUS:", r.status_code)
     print("TELEGRAM SEND RESPONSE:", r.text)
-
-def get_video_duration(msg):
-    try:
-        if msg.file and msg.file.duration:
-            return msg.file.duration
-    except Exception:
-        pass
-    return None
 
 async def main():
     client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
@@ -76,34 +63,40 @@ async def main():
 
     for msg in messages:
         text = msg.message or ""
+        full_text = f"{text}\n\n{CHANNEL_LINK}" if text else CHANNEL_LINK
 
+        is_video = bool(msg.media and isinstance(msg.media, MessageMediaDocument) and msg.video)
+        is_photo = bool(msg.media and isinstance(msg.media, MessageMediaPhoto))
+
+        # الفيديو: تحويل (forward) مباشرة بدون تحميل، مع إخفاء اسم المرسل، ثم تعديل الوصف
+        if is_video:
+            try:
+                sent = await client.forward_messages(TARGET_CHANNEL, msg, drop_author=True)
+                sent_msg = sent[0] if isinstance(sent, list) else sent
+                await client.edit_message(TARGET_CHANNEL, sent_msg, full_text)
+                print("DEBUG: forwarded video for msg", msg.id)
+            except Exception as e:
+                print("DEBUG: forward/edit failed for msg", msg.id, ":", e)
+            if msg.id > new_last_id:
+                new_last_id = msg.id
+            continue
+
+        # الصورة: تحميل وإرسال عن طريق البوت
         media_path = None
         media_type = None
-        if msg.media:
+        if is_photo:
             try:
-                detected_type = None
-                if isinstance(msg.media, MessageMediaPhoto):
-                    detected_type = "photo"
-                elif isinstance(msg.media, MessageMediaDocument) and msg.video:
-                    duration = get_video_duration(msg)
-                    if duration is not None and duration > VIDEO_MAX_SECONDS:
-                        print(f"DEBUG: skipping long video ({duration}s) for msg {msg.id}")
-                        detected_type = None
-                    else:
-                        detected_type = "video"
-
-                if detected_type:
-                    media_path = await asyncio.wait_for(
-                        client.download_media(msg, file="temp_media"),
-                        timeout=DOWNLOAD_TIMEOUT
-                    )
-                    media_type = detected_type
+                media_path = await asyncio.wait_for(
+                    client.download_media(msg, file="temp_media"),
+                    timeout=DOWNLOAD_TIMEOUT
+                )
+                media_type = "photo"
             except asyncio.TimeoutError:
-                print("DEBUG: media download timed out, sending as text only")
+                print("DEBUG: photo download timed out, sending as text only")
                 media_path = None
                 media_type = None
             except Exception as e:
-                print("DEBUG: media download failed:", e)
+                print("DEBUG: photo download failed:", e)
                 media_path = None
                 media_type = None
 
